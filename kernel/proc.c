@@ -113,6 +113,11 @@ found:
     return 0;
   }
 
+  if((p->alarmframe = (struct trapframe *)kalloc()) == 0){
+    release(&p->lock);
+    return 0;
+  }
+
   // An empty user page table.
   p->pagetable = proc_pagetable(p);
   if(p->pagetable == 0){
@@ -121,25 +126,16 @@ found:
     return 0;
   }
 
-  p->kpagetable = ukvminit();
-  if (p->kpagetable == 0) {
-    freeproc(p);
-    release(&p->lock);
-    return 0;
-  }
-  
-  uint64 va = KSTACK((int) (p - proc));
-  pte_t pa = kvmpa(va);
-  memset((void *)pa, 0, PGSIZE);
-  ukvmmap(p->kpagetable, va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
-  p->kstack = va;
-
   // Set up new context to start executing at forkret,
   // which returns to user space.
   memset(&p->context, 0, sizeof(p->context));
   p->context.ra = (uint64)forkret;
   p->context.sp = p->kstack + PGSIZE;
 
+  p->alarm_period = 0;
+  p->alarm_handler = 0;
+  p->ticks_since_last_alarm = 0;
+  p->inalarm = 0;
   return p;
 }
 
@@ -163,14 +159,10 @@ freeproc(struct proc *p)
   p->killed = 0;
   p->xstate = 0;
   p->state = UNUSED;
-
-  if (p->kpagetable) {
-    freeprockvm(p);
-    p->kpagetable = 0;
-  }
-  if (p->kstack) {
-    p->kstack = 0;
-  }
+  p->alarm_period = 0;
+  p->alarm_handler = 0;
+  p->ticks_since_last_alarm = 0;
+  p->inalarm = 0;
 }
 
 // Create a user page table for a given process,
@@ -242,8 +234,6 @@ userinit(void)
   uvminit(p->pagetable, initcode, sizeof(initcode));
   p->sz = PGSIZE;
 
-  pagecopy(p->pagetable, p->kpagetable, 0, p->sz);
-
   // prepare for the very first "return" from kernel to user.
   p->trapframe->epc = 0;      // user program counter
   p->trapframe->sp = PGSIZE;  // user stack pointer
@@ -266,19 +256,12 @@ growproc(int n)
 
   sz = p->sz;
   if(n > 0){
-    if(sz + n > PLIC || (sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
-      return -1;
-    }
-    if (pagecopy(p->pagetable, p->kpagetable, p->sz, sz) != 0) {
+    if((sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
       return -1;
     }
   } else if(n < 0){
     sz = uvmdealloc(p->pagetable, sz, sz + n);
-    if (sz != p->sz) {
-      uvmunmap(p->kpagetable, PGROUNDUP(sz), (PGROUNDUP(p->sz) - PGROUNDUP(sz)) / PGSIZE, 0);
-    }
   }
-  ukvminithard(p->kpagetable);
   p->sz = sz;
   return 0;
 }
@@ -304,12 +287,6 @@ fork(void)
     return -1;
   }
   np->sz = p->sz;
-
-  if (pagecopy(np->pagetable, np->kpagetable, 0, np->sz) != 0) {
-    freeproc(np);
-    release(&np->lock);
-    return -1;
-  }
 
   np->parent = p;
 
@@ -509,10 +486,7 @@ scheduler(void)
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
-        
-        ukvminithard(p->kpagetable);
         swtch(&c->context, &p->context);
-        kvminithart();
 
         // Process is done running for now.
         // It should have changed its p->state before coming back.
